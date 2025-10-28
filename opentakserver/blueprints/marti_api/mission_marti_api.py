@@ -24,6 +24,7 @@ from xml.etree.ElementTree import tostring, Element, fromstring, SubElement
 from opentakserver.blueprints.marti_api.marti_api import verify_client_cert
 from opentakserver.functions import iso8601_string_from_datetime, datetime_from_iso8601_string
 from opentakserver.extensions import db, logger
+from opentakserver.blueprints.federation.federation_helper import queue_mission_change_for_federation, should_federate_mission_change
 from opentakserver.models.CoT import CoT
 from opentakserver.models.EUD import EUD
 from opentakserver.models.Group import Group
@@ -37,6 +38,7 @@ from opentakserver.models.MissionRole import MissionRole
 from opentakserver.models.MissionUID import MissionUID
 from opentakserver.models.Team import Team
 from opentakserver.models.user import User
+from opentakserver.models.FederationOutbound import FederationOutbound
 
 mission_marti_api = Blueprint('mission_marti_api', __name__)
 
@@ -346,6 +348,10 @@ def put_mission(mission_name: str):
 
             db.session.add(mission_change)
             db.session.commit()
+
+            # Queue mission change for federation if enabled
+            if should_federate_mission_change(mission_change):
+                queue_mission_change_for_federation(mission_change.id)
 
             event = generate_new_mission_cot(mission)
 
@@ -1023,6 +1029,10 @@ def create_log_entry():
     db.session.add(mission_change)
     db.session.commit()
 
+    # Queue mission change for federation if enabled
+    if should_federate_mission_change(mission_change):
+        queue_mission_change_for_federation(mission_change.id)
+
     change_cot = generate_mission_change_cot(log_entry.mission_name, mission[0], mission_change, cot_type='t-x-m-c-l')
     body = json.dumps({'uid': log_entry.creator_uid, 'cot': tostring(change_cot).decode('utf-8')})
 
@@ -1229,6 +1239,10 @@ def mission_contents(mission_name: str):
                 db.session.commit()
                 change_pk = change_pk.inserted_primary_key[0]
 
+                # Queue mission change for federation if enabled
+                if should_federate_mission_change(mission_change):
+                    queue_mission_change_for_federation(change_pk)
+
             mission_uid.uid = uid
             mission_uid.timestamp = datetime.datetime.now(datetime.timezone.utc)
             mission_uid.creator_uid = request.args.get('creatorUid')
@@ -1285,6 +1299,21 @@ def mission_contents(mission_name: str):
                 rabbit_connection.close()
 
     db.session.commit()
+
+    # Queue any new mission changes for federation
+    # Get mission changes from this mission created in the last 10 seconds that aren't queued yet
+    recent_threshold = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=10)
+    recent_changes = db.session.query(MissionChange).filter(
+        MissionChange.mission_name == mission_name,
+        MissionChange.server_time >= recent_threshold,
+        MissionChange.isFederatedChange == False
+    ).all()
+
+    for change in recent_changes:
+        # Check if already queued
+        already_queued = db.session.query(FederationOutbound).filter_by(mission_change_id=change.id).first()
+        if not already_queued and should_federate_mission_change(change):
+            queue_mission_change_for_federation(change.id)
 
     return jsonify({"version": "3", "type": "Mission", "data": [mission.to_json()], "nodeId": app.config.get("OTS_NODE_ID")})
 
@@ -1368,6 +1397,10 @@ def delete_content(mission_name: str):
 
     db.session.add(mission_change)
     db.session.commit()
+
+    # Queue mission change for federation if enabled
+    if should_federate_mission_change(mission_change):
+        queue_mission_change_for_federation(mission_change.id)
 
     return jsonify({"version": "3", "type": "Mission", "data": [mission.to_json()], "nodeId": app.config.get("OTS_NODE_ID")})
 
