@@ -31,9 +31,14 @@ Join us on our [Discord server](https://discord.gg/6uaVHjtfXN)
 - Mission API
   - Data Sync plugin
   - Fire Area Survey plugin
+- Federation
+  - Server-to-server mission synchronization
+  - Federation v1 (port 9000) and v2 (port 9001) protocol support
+  - TLS mutual authentication
+  - Mission Federation Disruption Tolerance
+  - Outbound and inbound federation connections
 
 ## Planned Features
-- Federation
 - Groups/Channels
 
 ## Requirements
