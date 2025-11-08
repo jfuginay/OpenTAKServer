@@ -332,6 +332,22 @@ def main(app):
             logger.error(f"Failed to load plugins: {e}")
             logger.debug(traceback.format_exc())
 
+    # Initialize Federation Service
+    if app.config.get("OTS_ENABLE_FEDERATION"):
+        try:
+            logger.info("Starting Federation Service")
+            from opentakserver.blueprints.federation.federation_service import FederationService
+            app.federation_service = FederationService(app)
+            app.federation_service.start()
+            logger.info("Federation Service started successfully")
+        except BaseException as e:
+            logger.error(f"Failed to start Federation Service: {e}")
+            logger.debug(traceback.format_exc())
+            app.federation_service = None
+    else:
+        logger.info("Federation Service disabled")
+        app.federation_service = None
+
     app.start_time = datetime.now(timezone.utc)
 
     try:
@@ -341,6 +357,9 @@ def main(app):
         logger.warning("Caught CTRL+C, exiting...")
         if app.config.get("OTS_ENABLE_PLUGINS"):
             app.plugin_manager.stop_plugins()
+        if app.federation_service:
+            logger.info("Stopping Federation Service...")
+            app.federation_service.stop()
 
 
 def start():

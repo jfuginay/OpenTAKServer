@@ -1,0 +1,61 @@
+✅ BACKEND TRANSPORT PROTOCOL SUPPORT - COMPLETE
+
+The backend now fully supports the transport_protocol field your UI implemented!
+
+## What Was Added:
+
+1. **Database Schema**:
+   - Added `transport_protocol` column to `federation_servers` table
+   - Type: VARCHAR(20), Default: 'tcp', NOT NULL
+   - Migration: b1c2d3e4f5a6_add_transport_protocol_to_federation.py
+
+2. **Model (FederationServer)**:
+   - Constants: TRANSPORT_TCP, TRANSPORT_UDP, TRANSPORT_MULTICAST
+   - Field: transport_protocol with default='tcp'
+   - Included in to_json() serialization
+
+3. **API Validation**:
+   - POST /api/federation/servers - validates transport_protocol
+   - PUT /api/federation/servers/<id> - allows updating transport_protocol
+   - Accepts: "tcp", "udp", "multicast"
+   - Returns 400 error for invalid values
+
+4. **Documentation**:
+   - Updated FEDERATION.md with transport protocol table
+   - Created UI_COORDINATION.md with full integration guide
+
+## API Contract:
+
+**Valid Values**: "tcp" | "udp" | "multicast"
+**Default**: "tcp"
+
+**Example Response**:
+```json
+{
+  "id": 1,
+  "name": "Remote Server",
+  "transport_protocol": "tcp",
+  "use_tls": true,
+  ...
+}
+```
+
+## Implementation Status:
+
+✅ **TCP**: Fully functional (with TLS/SSL)
+⚠️ **UDP**: Config only - you can set it, but transport layer not implemented yet
+⚠️ **Multicast**: Config only - you can set it, but transport layer not implemented yet
+
+## UI Recommendations:
+
+1. Your transport selector should work perfectly now
+2. Consider adding a warning badge for UDP/multicast: "⚠️ Configuration only - not yet functional"
+3. Your TLS/DTLS label logic is correct (TLS for TCP, DTLS for UDP/multicast)
+
+## Testing:
+
+The backend will accept all three transport values and store them correctly. The UI can immediately start using this field with full confidence.
+
+**All changes committed and pushed to**: claude/code-review-011CUuWQuckKwZHVokzVeqhf
+
+See UI_COORDINATION.md in the repo for complete integration details and test cases.

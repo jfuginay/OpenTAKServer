@@ -14,8 +14,12 @@ import socket
 import threading
 import time
 import json
-from xml.etree.ElementTree import tostring
-from datetime import datetime
+import tempfile
+import os
+import uuid
+from xml.etree import ElementTree as ET
+from xml.etree.ElementTree import tostring, Element
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from opentakserver.extensions import db, logger
@@ -23,6 +27,8 @@ from opentakserver.models.FederationServer import FederationServer
 from opentakserver.models.FederationOutbound import FederationOutbound
 from opentakserver.models.MissionChange import MissionChange, generate_mission_change_cot
 from opentakserver.models.Mission import Mission
+from opentakserver.models.MissionContent import MissionContent
+from opentakserver.models.MissionUID import MissionUID
 
 
 class FederationConnection:
@@ -45,6 +51,10 @@ class FederationConnection:
         self.send_thread: Optional[threading.Thread] = None
         self.receive_thread: Optional[threading.Thread] = None
         self.heartbeat_thread: Optional[threading.Thread] = None
+        # Temporary certificate files (cleaned up on disconnect)
+        self.temp_ca_file: Optional[str] = None
+        self.temp_cert_file: Optional[str] = None
+        self.temp_key_file: Optional[str] = None
 
     def connect(self) -> bool:
         """
@@ -67,15 +77,37 @@ class FederationConnection:
 
                 # Load CA certificate if provided
                 if self.federation_server.ca_certificate:
-                    # TODO: Write CA cert to temp file and load it
-                    # context.load_verify_locations(ca_cert_file)
-                    pass
+                    # Write CA cert to secure temp file
+                    fd, self.temp_ca_file = tempfile.mkstemp(suffix='.crt', text=True)
+                    try:
+                        os.write(fd, self.federation_server.ca_certificate.encode('utf-8'))
+                        os.close(fd)
+                        context.load_verify_locations(cafile=self.temp_ca_file)
+                        logger.debug(f"Loaded CA certificate for {self.federation_server.name}")
+                    except Exception as e:
+                        logger.error(f"Failed to load CA certificate: {e}")
+                        os.close(fd)
+                        raise
 
                 # Load client certificate and key for mutual TLS
                 if self.federation_server.client_certificate and self.federation_server.client_key:
-                    # TODO: Write cert/key to temp files and load them
-                    # context.load_cert_chain(cert_file, key_file)
-                    pass
+                    # Write cert and key to secure temp files
+                    cert_fd, self.temp_cert_file = tempfile.mkstemp(suffix='.crt', text=True)
+                    key_fd, self.temp_key_file = tempfile.mkstemp(suffix='.key', text=True)
+                    try:
+                        os.write(cert_fd, self.federation_server.client_certificate.encode('utf-8'))
+                        os.close(cert_fd)
+                        os.write(key_fd, self.federation_server.client_key.encode('utf-8'))
+                        os.close(key_fd)
+                        # Set restrictive permissions on key file
+                        os.chmod(self.temp_key_file, 0o600)
+                        context.load_cert_chain(certfile=self.temp_cert_file, keyfile=self.temp_key_file)
+                        logger.debug(f"Loaded client certificate for {self.federation_server.name}")
+                    except Exception as e:
+                        logger.error(f"Failed to load client certificate: {e}")
+                        os.close(cert_fd)
+                        os.close(key_fd)
+                        raise
 
                 # Disable SSL verification if configured
                 if not self.federation_server.verify_ssl:
@@ -112,6 +144,9 @@ class FederationConnection:
             logger.error(f"Failed to connect to federation server {self.federation_server.name}: {e}",
                         exc_info=True)
 
+            # Clean up any temp files that may have been created
+            self._cleanup_temp_files()
+
             # Update database status
             try:
                 with db.session.begin():
@@ -145,6 +180,9 @@ class FederationConnection:
         if self.heartbeat_thread and self.heartbeat_thread.is_alive():
             self.heartbeat_thread.join(timeout=5)
 
+        # Clean up temporary certificate files
+        self._cleanup_temp_files()
+
         # Update database status
         try:
             with db.session.begin():
@@ -152,6 +190,20 @@ class FederationConnection:
                 server.status = FederationServer.STATUS_DISCONNECTED
         except Exception as e:
             logger.error(f"Failed to update federation server status: {e}", exc_info=True)
+
+    def _cleanup_temp_files(self):
+        """Clean up temporary certificate files"""
+        for temp_file in [self.temp_ca_file, self.temp_cert_file, self.temp_key_file]:
+            if temp_file and os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                    logger.debug(f"Removed temporary file: {temp_file}")
+                except Exception as e:
+                    logger.error(f"Failed to remove temporary file {temp_file}: {e}")
+
+        self.temp_ca_file = None
+        self.temp_cert_file = None
+        self.temp_key_file = None
 
     def start_threads(self):
         """Start background threads for sending, receiving, and heartbeat"""
@@ -276,14 +328,74 @@ class FederationConnection:
 
         while self.running and self.connected:
             try:
-                # Send a simple heartbeat CoT message
-                # TODO: Implement proper TAK heartbeat/ping message
+                # Create and send TAK heartbeat/ping message
+                heartbeat_cot = self._create_heartbeat_cot()
+                self.socket.sendall(heartbeat_cot.encode('utf-8'))
+                logger.debug(f"Sent heartbeat to {self.federation_server.name}")
+
                 time.sleep(interval)
 
             except Exception as e:
                 logger.error(f"Error in heartbeat loop for {self.federation_server.name}: {e}", exc_info=True)
+                # If we can't send heartbeat, connection is probably broken
+                self.connected = False
+                break
 
         logger.info(f"Heartbeat loop stopped for federation server: {self.federation_server.name}")
+
+    def _create_heartbeat_cot(self) -> str:
+        """
+        Create a TAK heartbeat/ping CoT message.
+
+        Returns:
+            XML string representing a TAK heartbeat message
+        """
+        # Get node ID from config or use federation server name
+        node_id = self.app_config.get('OTS_NODE_ID', self.federation_server.name)
+
+        # Create heartbeat event
+        now = datetime.now(timezone.utc)
+        stale_time = now + timedelta(seconds=self.app_config.get('OTS_FEDERATION_HEARTBEAT_INTERVAL', 30) * 2)
+
+        event = Element('event')
+        event.set('version', '2.0')
+        event.set('uid', f"{node_id}-ping")
+        event.set('type', 't-x-c-t')  # TAK Contact
+        event.set('time', now.strftime('%Y-%m-%dT%H:%M:%S.%fZ'))
+        event.set('start', now.strftime('%Y-%m-%dT%H:%M:%S.%fZ'))
+        event.set('stale', stale_time.strftime('%Y-%m-%dT%H:%M:%S.%fZ'))
+        event.set('how', 'h-g-i-g-o')  # Generated
+
+        # Add point element (required)
+        point = Element('point')
+        point.set('lat', '0.0')
+        point.set('lon', '0.0')
+        point.set('hae', '0.0')
+        point.set('ce', '9999999.0')
+        point.set('le', '9999999.0')
+        event.append(point)
+
+        # Add detail element with contact info
+        detail = Element('detail')
+
+        contact = Element('contact')
+        contact.set('callsign', f"OTS-{node_id}")
+        detail.append(contact)
+
+        # Add takv element (TAK version info)
+        takv = Element('takv')
+        takv.set('platform', 'OpenTAKServer')
+        takv.set('version', self.app_config.get('OTS_VERSION', '1.0.0'))
+        takv.set('device', 'federation-server')
+        takv.set('os', 'Linux')
+        detail.append(takv)
+
+        event.append(detail)
+
+        # Convert to XML string
+        xml_str = tostring(event, encoding='unicode')
+
+        return xml_str
 
     def _process_federated_cot(self, cot_xml: bytes):
         """
@@ -293,17 +405,127 @@ class FederationConnection:
             cot_xml: Raw CoT XML message
         """
         try:
-            # TODO: Parse CoT XML and process mission changes
-            # This should:
-            # 1. Parse the XML to extract mission change details
-            # 2. Check if it's a mission-related CoT
-            # 3. Create a MissionChange record with isFederatedChange=True
-            # 4. Broadcast to local clients via RabbitMQ
+            # Parse XML
+            root = ET.fromstring(cot_xml.decode('utf-8'))
 
-            logger.debug(f"Received CoT from {self.federation_server.name}: {cot_xml[:200]}")
+            # Check if this is a mission-related CoT (type starts with t-x-m-)
+            cot_type = root.get('type', '')
 
+            # Skip heartbeat and non-mission CoT messages
+            if cot_type.startswith('t-x-c-t') or cot_type.startswith('a-'):
+                logger.debug(f"Skipping non-mission CoT type: {cot_type}")
+                return
+
+            # Look for mission details in the detail element
+            detail = root.find('detail')
+            if detail is None:
+                logger.debug(f"No detail element in CoT, skipping")
+                return
+
+            mission_elem = detail.find('mission')
+            if mission_elem is None:
+                logger.debug(f"No mission element in CoT, skipping")
+                return
+
+            # Extract mission information
+            mission_name = mission_elem.get('name')
+            mission_guid = mission_elem.get('guid')
+            author_uid = mission_elem.get('authorUid', root.get('uid'))
+
+            if not mission_name:
+                logger.warning(f"Mission element has no name, skipping")
+                return
+
+            # Find or create the mission
+            with db.session.begin():
+                mission = db.session.query(Mission).filter_by(name=mission_name).first()
+                if not mission:
+                    # Create new mission if it doesn't exist
+                    logger.info(f"Creating new mission from federation: {mission_name}")
+                    mission = Mission(
+                        name=mission_name,
+                        guid=mission_guid or str(uuid.uuid4()),
+                        creator_uid=author_uid,
+                        created=datetime.utcnow()
+                    )
+                    db.session.add(mission)
+                    db.session.flush()  # Get the mission ID
+
+                # Look for MissionChanges element
+                mission_changes_elem = mission_elem.find('MissionChanges')
+                if mission_changes_elem is not None:
+                    for change_elem in mission_changes_elem.findall('MissionChange'):
+                        self._process_mission_change(
+                            root, mission, change_elem, author_uid
+                        )
+                else:
+                    # If no explicit MissionChanges, treat as a general mission update
+                    logger.debug(f"Received mission update from federation: {mission_name}")
+
+            logger.debug(f"Processed federated CoT for mission: {mission_name}")
+
+        except ET.ParseError as e:
+            logger.error(f"Failed to parse CoT XML from {self.federation_server.name}: {e}")
         except Exception as e:
             logger.error(f"Error processing federated CoT: {e}", exc_info=True)
+
+    def _process_mission_change(self, cot_root, mission: Mission, change_elem, author_uid: str):
+        """
+        Process a single mission change from federated CoT.
+
+        Args:
+            cot_root: Root XML element of the CoT message
+            mission: Mission object
+            change_elem: MissionChange XML element
+            author_uid: UID of the change author
+        """
+        try:
+            # Extract change type
+            change_type = change_elem.get('type', MissionChange.CHANGE)
+
+            # Get timestamp from CoT root
+            timestamp_str = cot_root.get('time')
+            if timestamp_str:
+                timestamp = datetime.strptime(timestamp_str.replace('Z', '+00:00'), '%Y-%m-%dT%H:%M:%S.%f%z')
+            else:
+                timestamp = datetime.utcnow()
+
+            # Look for content resource
+            content_uid = None
+            content_resource_elem = change_elem.find('contentResource')
+            if content_resource_elem is not None:
+                content_uid_elem = content_resource_elem.find('uid')
+                if content_uid_elem is not None and content_uid_elem.text:
+                    content_uid = content_uid_elem.text
+
+            # Look for mission UID
+            mission_uid = None
+            mission_uid_elem = change_elem.find('missionUid')
+            if mission_uid_elem is not None and mission_uid_elem.text:
+                mission_uid = mission_uid_elem.text
+
+            # Create MissionChange record with isFederatedChange=True
+            mission_change = MissionChange(
+                content_uid=content_uid,
+                isFederatedChange=True,  # Mark as federated to prevent loops
+                change_type=change_type,
+                mission_name=mission.name,
+                timestamp=timestamp,
+                creator_uid=author_uid,
+                server_time=datetime.utcnow(),
+                mission_uid=mission_uid
+            )
+
+            db.session.add(mission_change)
+
+            logger.info(f"Created federated mission change: {change_type} for mission {mission.name}")
+
+            # Note: Broadcasting to local clients via RabbitMQ would be done here
+            # but requires RabbitMQ channel integration which is complex
+            # For now, the mission change is persisted to the database
+
+        except Exception as e:
+            logger.error(f"Failed to process mission change: {e}", exc_info=True)
 
 
 class FederationService:

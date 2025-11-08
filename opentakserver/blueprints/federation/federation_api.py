@@ -266,22 +266,47 @@ def test_federation_connection(server_id):
         JSON with test results
     """
     try:
+        from flask import current_app
+        from opentakserver.blueprints.federation.federation_service import FederationConnection
+        import time
+
         server = FederationServer.query.get(server_id)
         if not server:
             return jsonify({'success': False, 'error': 'Federation server not found'}), 404
 
-        # TODO: Implement actual connection test
-        # For now, return a placeholder response
+        # Attempt to create a test connection
+        logger.info(f"Testing connection to federation server: {server.name}")
+        test_conn = FederationConnection(server, current_app.config)
 
-        return jsonify({
-            'success': True,
-            'message': 'Connection test not yet implemented',
-            'server': server.to_json()
-        }), 200
+        # Try to connect (with a timeout)
+        start_time = time.time()
+        success = test_conn.connect()
+        elapsed = time.time() - start_time
+
+        # Disconnect immediately
+        if success:
+            test_conn.disconnect()
+
+            return jsonify({
+                'success': True,
+                'message': f'Successfully connected to {server.name}',
+                'connection_time_ms': round(elapsed * 1000, 2),
+                'server': server.to_json()
+            }), 200
+        else:
+            return jsonify({
+                'success': False,
+                'error': f'Failed to connect to {server.name}. Check logs for details.',
+                'server': server.to_json()
+            }), 503
 
     except Exception as e:
         logger.error(f"Error testing federation connection: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'details': 'Connection test failed with exception'
+        }), 500
 
 
 @federation_blueprint.route('/api/federation/health', methods=['GET'])
