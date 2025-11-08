@@ -44,6 +44,7 @@ def create_federation_server():
         - description: Description of the federation server
         - connection_type: "outbound" or "inbound" (default: "outbound")
         - protocol_version: "v1" or "v2" (default: "v2")
+        - transport_protocol: "tcp", "udp", or "multicast" (default: "tcp")
         - use_tls: Boolean (default: true)
         - verify_ssl: Boolean (default: true)
         - ca_certificate: Remote server's CA certificate (PEM format)
@@ -84,6 +85,11 @@ def create_federation_server():
         if protocol_version not in [FederationServer.FEDERATION_V1, FederationServer.FEDERATION_V2]:
             return jsonify({'success': False, 'error': 'Invalid protocol_version. Must be "v1" or "v2"'}), 400
 
+        # Validate transport protocol
+        transport_protocol = data.get('transport_protocol', FederationServer.TRANSPORT_TCP)
+        if transport_protocol not in [FederationServer.TRANSPORT_TCP, FederationServer.TRANSPORT_UDP, FederationServer.TRANSPORT_MULTICAST]:
+            return jsonify({'success': False, 'error': 'Invalid transport_protocol. Must be "tcp", "udp", or "multicast"'}), 400
+
         # Create federation server
         server = FederationServer(
             name=data['name'],
@@ -92,6 +98,7 @@ def create_federation_server():
             port=data['port'],
             connection_type=connection_type,
             protocol_version=protocol_version,
+            transport_protocol=transport_protocol,
             use_tls=data.get('use_tls', True),
             verify_ssl=data.get('verify_ssl', True),
             ca_certificate=data.get('ca_certificate'),
@@ -156,8 +163,8 @@ def update_federation_server(server_id):
         # Update fields
         updateable_fields = [
             'name', 'description', 'address', 'port', 'connection_type', 'protocol_version',
-            'use_tls', 'verify_ssl', 'ca_certificate', 'client_certificate', 'client_key',
-            'sync_missions', 'sync_cot', 'mission_filter', 'enabled'
+            'transport_protocol', 'use_tls', 'verify_ssl', 'ca_certificate', 'client_certificate',
+            'client_key', 'sync_missions', 'sync_cot', 'mission_filter', 'enabled'
         ]
 
         for field in updateable_fields:

@@ -54,6 +54,16 @@ Federation enables multiple TAK servers to connect and share tactical informatio
 | v1 | 9000 | Legacy | Original federation protocol |
 | v2 | 9001 | Current | Enhanced federation protocol with improved features |
 
+### Transport Protocols
+
+| Transport | Status | Encryption | Description |
+|-----------|--------|------------|-------------|
+| TCP | ✅ Supported | TLS/SSL | Default transport (recommended) |
+| UDP | ⚠️ Planned | DTLS | Datagram transport (configuration available) |
+| Multicast | ⚠️ Planned | DTLS | Multicast group transport (configuration available) |
+
+**Note**: UDP and multicast transports are configured in the database and API but implementation is pending. Currently only TCP with TLS/SSL is functional.
+
 ## Configuration
 
 ### Environment Variables
@@ -272,7 +282,8 @@ POST /api/federation/servers
 - `description`: Server description
 - `connection_type`: "outbound" or "inbound" (default: "outbound")
 - `protocol_version`: "v1" or "v2" (default: "v2")
-- `use_tls`: Boolean (default: true)
+- `transport_protocol`: "tcp", "udp", or "multicast" (default: "tcp")
+- `use_tls`: Boolean (default: true, use_dtls for UDP)
 - `verify_ssl`: Boolean (default: true)
 - `ca_certificate`: Remote CA certificate (PEM format)
 - `client_certificate`: Client certificate for outbound (PEM format)
