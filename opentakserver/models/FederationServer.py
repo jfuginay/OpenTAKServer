@@ -23,6 +23,11 @@ class FederationServer(db.Model):
     FEDERATION_V1 = "v1"  # Legacy federation protocol (port 9000)
     FEDERATION_V2 = "v2"  # Current federation protocol (port 9001)
 
+    # Transport protocols
+    TRANSPORT_TCP = "tcp"        # TCP transport (default)
+    TRANSPORT_UDP = "udp"        # UDP transport
+    TRANSPORT_MULTICAST = "multicast"  # Multicast transport
+
     # Connection status
     STATUS_CONNECTED = "connected"
     STATUS_DISCONNECTED = "disconnected"
@@ -41,6 +46,7 @@ class FederationServer(db.Model):
     port: Mapped[int] = mapped_column(Integer, nullable=False)
     connection_type: Mapped[str] = mapped_column(String(50), nullable=False, default=OUTBOUND)
     protocol_version: Mapped[str] = mapped_column(String(10), nullable=False, default=FEDERATION_V2)
+    transport_protocol: Mapped[str] = mapped_column(String(20), nullable=False, default=TRANSPORT_TCP)
 
     # TLS/SSL Configuration
     use_tls: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -78,6 +84,7 @@ class FederationServer(db.Model):
             "port": self.port,
             "connection_type": self.connection_type,
             "protocol_version": self.protocol_version,
+            "transport_protocol": self.transport_protocol,
             "use_tls": self.use_tls,
             "verify_ssl": self.verify_ssl,
             "enabled": self.enabled,
