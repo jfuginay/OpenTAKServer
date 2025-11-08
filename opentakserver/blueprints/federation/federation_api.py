@@ -289,8 +289,9 @@ def test_federation_connection(server_id):
 
             return jsonify({
                 'success': True,
-                'message': f'Successfully connected to {server.name}',
+                'message': f'Successfully connected to {server.name} via {server.transport_protocol.upper()}',
                 'connection_time_ms': round(elapsed * 1000, 2),
+                'transport_protocol': server.transport_protocol,
                 'server': server.to_json()
             }), 200
         else:

@@ -7,6 +7,21 @@ This service handles:
 3. Mission change synchronization
 4. CoT message federation
 5. Connection health monitoring and retry logic
+
+Transport Protocol Support:
+- TCP: Stream-based transport with TLS encryption (default, recommended)
+- UDP: Datagram-based transport (currently unencrypted - DTLS not implemented)
+
+DTLS Limitation:
+UDP connections are currently unencrypted. DTLS (Datagram TLS) support requires
+additional dependencies (e.g., PyDTLS) which are not currently available.
+For production use with sensitive data, TCP with TLS is recommended.
+
+UDP-Specific Considerations:
+- Connectionless: UDP does not establish a persistent connection
+- Unreliable: Packets may be lost, duplicated, or arrive out of order
+- MTU Limited: Each CoT message must fit within the MTU (typically 1500 bytes)
+- No Flow Control: Application must handle rate limiting
 """
 
 import ssl
@@ -17,10 +32,11 @@ import json
 import tempfile
 import os
 import uuid
+import struct
 from xml.etree import ElementTree as ET
 from xml.etree.ElementTree import tostring, Element
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Tuple
 
 from opentakserver.extensions import db, logger
 from opentakserver.models.FederationServer import FederationServer
@@ -30,23 +46,41 @@ from opentakserver.models.Mission import Mission
 from opentakserver.models.MissionContent import MissionContent
 from opentakserver.models.MissionUID import MissionUID
 
+# Maximum UDP datagram size (accounting for IP/UDP headers)
+# Conservative size to avoid fragmentation: 1500 (Ethernet MTU) - 20 (IP) - 8 (UDP) = 1472
+# But TAK typically uses larger buffers, so we'll use 8192 and log warnings for oversized messages
+MAX_UDP_DATAGRAM_SIZE = 8192
+SAFE_UDP_SIZE = 1400  # Safe size to avoid fragmentation
+
 
 class FederationConnection:
     """
     Represents an active connection to a federated server.
 
     Handles:
-    - TLS socket connection
+    - TCP/UDP socket connections
+    - TLS encryption (TCP only, DTLS not currently supported for UDP)
     - Message sending/receiving
-    - Heartbeat/keepalive
+    - Heartbeat/keepalive (TCP only)
     - Reconnection logic
     """
 
-    def __init__(self, federation_server: FederationServer, app_config):
+    def __init__(self, federation_server: FederationServer, app_config, is_inbound: bool = False,
+                 wrapped_socket: Optional[socket.socket] = None):
+        """
+        Initialize a federation connection.
+
+        Args:
+            federation_server: FederationServer database object
+            app_config: Application configuration dict
+            is_inbound: True if this is an inbound connection (remote connected to us)
+            wrapped_socket: Already-connected socket (for inbound connections)
+        """
         self.federation_server = federation_server
         self.app_config = app_config
-        self.socket: Optional[socket.socket] = None
-        self.connected = False
+        self.is_inbound = is_inbound
+        self.socket: Optional[socket.socket] = wrapped_socket
+        self.connected = bool(wrapped_socket)  # If socket provided, we're already connected
         self.running = False
         self.send_thread: Optional[threading.Thread] = None
         self.receive_thread: Optional[threading.Thread] = None
@@ -55,6 +89,19 @@ class FederationConnection:
         self.temp_ca_file: Optional[str] = None
         self.temp_cert_file: Optional[str] = None
         self.temp_key_file: Optional[str] = None
+        # Remote address for UDP (stored for connectionless communication)
+        self.remote_addr: Optional[Tuple[str, int]] = None
+
+        # Check if using UDP transport
+        self.is_udp = self.federation_server.transport_protocol == FederationServer.TRANSPORT_UDP
+
+        # Warn about UDP encryption limitation
+        if self.is_udp and self.federation_server.use_tls:
+            logger.warning(
+                f"DTLS is not currently supported for UDP federation. "
+                f"Connection to {self.federation_server.name} will be UNENCRYPTED. "
+                f"For encrypted federation, use TCP transport protocol."
+            )
 
     def connect(self) -> bool:
         """
@@ -65,9 +112,14 @@ class FederationConnection:
         """
         try:
             logger.info(f"Connecting to federation server: {self.federation_server.name} "
-                       f"({self.federation_server.address}:{self.federation_server.port})")
+                       f"({self.federation_server.address}:{self.federation_server.port}) "
+                       f"via {self.federation_server.transport_protocol.upper()}")
 
-            # Create socket
+            # Branch based on transport protocol
+            if self.is_udp:
+                return self._connect_udp()
+
+            # TCP connection
             raw_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             raw_socket.settimeout(30)
 
@@ -159,6 +211,51 @@ class FederationConnection:
             self.connected = False
             return False
 
+
+    def _connect_udp(self) -> bool:
+        """
+        Establish UDP socket (connectionless).
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Create UDP socket
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.socket.settimeout(30)
+
+            # Store remote address for sending
+            self.remote_addr = (self.federation_server.address, self.federation_server.port)
+
+            # For UDP, we can optionally call connect() to bind the socket to the remote address
+            # This allows us to use send() instead of sendto()
+            try:
+                self.socket.connect(self.remote_addr)
+                logger.debug(f"Bound UDP socket to {self.remote_addr}")
+            except Exception as e:
+                logger.warning(f"Could not bind UDP socket to {self.remote_addr}: {e}. Will use sendto() instead.")
+
+            self.connected = True
+            self.running = True
+
+            # Update database status
+            with db.session.begin():
+                server = db.session.query(FederationServer).get(self.federation_server.id)
+                server.status = FederationServer.STATUS_CONNECTED
+                server.last_connected = datetime.utcnow()
+                server.last_error = None
+
+            logger.info(f"Successfully initialized UDP socket for federation server: {self.federation_server.name}")
+
+            # Start threads (no heartbeat for UDP)
+            self.start_threads()
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to initialize UDP socket: {e}", exc_info=True)
+            return False
+
     def disconnect(self):
         """Disconnect from the federated server"""
         logger.info(f"Disconnecting from federation server: {self.federation_server.name}")
@@ -209,11 +306,51 @@ class FederationConnection:
         """Start background threads for sending, receiving, and heartbeat"""
         self.send_thread = threading.Thread(target=self._send_loop, daemon=True)
         self.receive_thread = threading.Thread(target=self._receive_loop, daemon=True)
-        self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
 
         self.send_thread.start()
         self.receive_thread.start()
-        self.heartbeat_thread.start()
+
+        # Only start heartbeat for TCP connections (UDP is connectionless)
+        if not self.is_udp:
+            self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+            self.heartbeat_thread.start()
+
+
+    def _send_message_tcp(self, data: bytes):
+        """Send data via TCP stream."""
+        self.socket.sendall(data)
+
+    def _send_message_udp(self, data: bytes):
+        """
+        Send data via UDP datagram.
+        
+        Args:
+            data: Raw bytes to send
+            
+        Raises:
+            ValueError: If message exceeds safe UDP size
+        """
+        if len(data) > MAX_UDP_DATAGRAM_SIZE:
+            raise ValueError(
+                f"Message size ({len(data)} bytes) exceeds maximum UDP datagram size "
+                f"({MAX_UDP_DATAGRAM_SIZE} bytes). Message will be truncated or dropped."
+            )
+
+        if len(data) > SAFE_UDP_SIZE:
+            logger.warning(
+                f"UDP message size ({len(data)} bytes) exceeds safe size ({SAFE_UDP_SIZE} bytes). "
+                f"Message may be fragmented and could be dropped."
+            )
+
+        # Try to use send() if socket was connect()ed, otherwise use sendto()
+        try:
+            self.socket.send(data)
+        except OSError:
+            # Socket not connected, use sendto()
+            if self.remote_addr:
+                self.socket.sendto(data, self.remote_addr)
+            else:
+                raise ValueError("No remote address configured for UDP connection")
 
     def _send_loop(self):
         """
@@ -252,8 +389,11 @@ class FederationConnection:
                             # Convert to XML string
                             cot_xml = tostring(cot_element, encoding='utf-8')
 
-                            # Send to federated server
-                            self.socket.sendall(cot_xml)
+                            # Send via appropriate transport
+                            if self.is_udp:
+                                self._send_message_udp(cot_xml)
+                            else:
+                                self._send_message_tcp(cot_xml)
 
                             # Update outbound record
                             outbound.sent = True
@@ -283,9 +423,19 @@ class FederationConnection:
         Background thread that receives mission changes from the federated server.
 
         Processes incoming CoT messages and creates mission changes marked as federated.
+        Handles both TCP (stream) and UDP (datagram) transports.
         """
         logger.info(f"Starting receive loop for federation server: {self.federation_server.name}")
 
+        if self.is_udp:
+            self._receive_loop_udp()
+        else:
+            self._receive_loop_tcp()
+
+        logger.info(f"Receive loop stopped for federation server: {self.federation_server.name}")
+
+    def _receive_loop_tcp(self):
+        """TCP receive loop - handles stream data with buffering"""
         buffer = b""
 
         while self.running and self.connected:
@@ -316,7 +466,37 @@ class FederationConnection:
                 self.connected = False
                 break
 
-        logger.info(f"Receive loop stopped for federation server: {self.federation_server.name}")
+
+    def _receive_loop_udp(self):
+        """UDP receive loop - handles discrete datagrams"""
+        while self.running and self.connected:
+            try:
+                # Receive datagram - each CoT message should be a complete datagram
+                data, addr = self.socket.recvfrom(MAX_UDP_DATAGRAM_SIZE)
+
+                if not data:
+                    continue
+
+                # Update remote address from first received packet
+                if not self.remote_addr:
+                    self.remote_addr = addr
+                    logger.debug(f"Set remote address to {addr} from first UDP packet")
+
+                # Process the CoT message (should be complete in one datagram)
+                if b"<event" in data and b"</event>" in data:
+                    self._process_federated_cot(data)
+                else:
+                    logger.warning(
+                        f"Received incomplete or fragmented UDP datagram from {addr} "
+                        f"({len(data)} bytes). CoT message may be too large for UDP."
+                    )
+
+            except socket.timeout:
+                continue
+            except Exception as e:
+                logger.error(f"Error in UDP receive loop for {self.federation_server.name}: {e}", exc_info=True)
+                # For UDP, we don't mark as disconnected on receive errors since it's connectionless
+                time.sleep(1)
 
     def _heartbeat_loop(self):
         """
@@ -528,6 +708,315 @@ class FederationConnection:
             logger.error(f"Failed to process mission change: {e}", exc_info=True)
 
 
+
+class FederationListener:
+    """
+    Listens for incoming federation connections on a specific port.
+
+    Handles:
+    - TLS server socket creation
+    - Accepting incoming connections
+    - Mutual TLS authentication
+    - Creating FederationConnection instances for accepted connections
+    """
+
+    def __init__(self, port: int, protocol_version: str, app_config, service):
+        """
+        Initialize federation listener.
+
+        Args:
+            port: Port to listen on
+            protocol_version: Federation protocol version ("v1" or "v2")
+            app_config: Application configuration dict
+            service: Reference to FederationService for connection management
+        """
+        self.port = port
+        self.protocol_version = protocol_version
+        self.app_config = app_config
+        self.service = service
+        self.running = False
+        self.listener_socket: Optional[socket.socket] = None
+        self.listener_thread: Optional[threading.Thread] = None
+
+    def start(self):
+        """Start the federation listener"""
+        logger.info(f"Starting Federation Listener on port {self.port} (protocol: {self.protocol_version})")
+
+        try:
+            # Create socket
+            self.listener_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.listener_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+            # Bind to address and port
+            bind_address = self.app_config.get('OTS_FEDERATION_BIND_ADDRESS', '0.0.0.0')
+            self.listener_socket.bind((bind_address, self.port))
+            self.listener_socket.listen(5)
+
+            # Set timeout so we can periodically check if we should stop
+            self.listener_socket.settimeout(5.0)
+
+            logger.info(f"Federation Listener bound to {bind_address}:{self.port}")
+
+            # Start listening thread
+            self.running = True
+            self.listener_thread = threading.Thread(
+                target=self._listen_loop,
+                daemon=True,
+                name=f"FederationListener-{self.protocol_version}-{self.port}"
+            )
+            self.listener_thread.start()
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to start federation listener on port {self.port}: {e}", exc_info=True)
+            if self.listener_socket:
+                try:
+                    self.listener_socket.close()
+                except:
+                    pass
+            return False
+
+    def stop(self):
+        """Stop the federation listener"""
+        logger.info(f"Stopping Federation Listener on port {self.port}")
+
+        self.running = False
+
+        if self.listener_socket:
+            try:
+                self.listener_socket.close()
+            except Exception as e:
+                logger.error(f"Error closing listener socket: {e}")
+
+        if self.listener_thread and self.listener_thread.is_alive():
+            self.listener_thread.join(timeout=10)
+
+        logger.info(f"Federation Listener stopped on port {self.port}")
+
+    def _listen_loop(self):
+        """
+        Background thread that accepts incoming federation connections.
+        """
+        logger.info(f"Federation listener loop started on port {self.port}")
+
+        while self.running:
+            try:
+                # Accept connection (with timeout)
+                try:
+                    client_socket, client_address = self.listener_socket.accept()
+                except socket.timeout:
+                    # Timeout is expected - allows us to check self.running periodically
+                    continue
+                except OSError as e:
+                    # Socket was closed
+                    if not self.running:
+                        break
+                    raise
+
+                logger.info(f"Accepted federation connection from {client_address[0]}:{client_address[1]}")
+
+                # Handle the connection in a separate thread
+                handler_thread = threading.Thread(
+                    target=self._handle_connection,
+                    args=(client_socket, client_address),
+                    daemon=True,
+                    name=f"FederationHandler-{client_address[0]}"
+                )
+                handler_thread.start()
+
+            except Exception as e:
+                if self.running:
+                    logger.error(f"Error in federation listener loop: {e}", exc_info=True)
+                    time.sleep(5)
+
+        logger.info(f"Federation listener loop stopped on port {self.port}")
+
+    def _handle_connection(self, client_socket: socket.socket, client_address: tuple):
+        """
+        Handle an accepted connection by wrapping with TLS and creating FederationConnection.
+
+        Args:
+            client_socket: Accepted client socket
+            client_address: Tuple of (ip, port) for the client
+        """
+        wrapped_socket = None
+        peer_cert = None
+        client_ip = client_address[0]
+        client_port = client_address[1]
+
+        try:
+            # Wrap with TLS
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+
+            # Load server certificate and key
+            cert_file = self.app_config.get('OTS_FEDERATION_CERT_FILE')
+            key_file = self.app_config.get('OTS_FEDERATION_KEY_FILE')
+
+            if not cert_file or not key_file:
+                logger.error("Federation server certificate or key file not configured")
+                client_socket.close()
+                return
+
+            if not os.path.exists(cert_file) or not os.path.exists(key_file):
+                logger.error(f"Federation server certificate or key file not found: {cert_file}, {key_file}")
+                client_socket.close()
+                return
+
+            context.load_cert_chain(certfile=cert_file, keyfile=key_file)
+
+            # Configure mutual TLS (require client certificate)
+            context.verify_mode = ssl.CERT_REQUIRED
+
+            # Load CA certificate or truststore for client verification
+            ca_file = self.app_config.get('OTS_FEDERATION_CA_FILE')
+            truststore_dir = self.app_config.get('OTS_FEDERATION_TRUSTSTORE_DIR')
+
+            if ca_file and os.path.exists(ca_file):
+                context.load_verify_locations(cafile=ca_file)
+                logger.debug(f"Loaded CA file: {ca_file}")
+            elif truststore_dir and os.path.exists(truststore_dir):
+                context.load_verify_locations(capath=truststore_dir)
+                logger.debug(f"Loaded truststore directory: {truststore_dir}")
+            else:
+                logger.warning("No CA file or truststore directory configured - using default verification")
+
+            # Wrap socket with TLS
+            wrapped_socket = context.wrap_socket(client_socket, server_side=True)
+
+            # Get peer certificate
+            peer_cert = wrapped_socket.getpeercert()
+
+            # Log certificate information
+            if peer_cert:
+                subject = dict(x[0] for x in peer_cert.get('subject', ()))
+                issuer = dict(x[0] for x in peer_cert.get('issuer', ()))
+                cn = subject.get('commonName', 'Unknown')
+                logger.info(f"Client certificate CN: {cn}, Issuer: {issuer.get('commonName', 'Unknown')}")
+            else:
+                logger.warning(f"No client certificate received from {client_ip}")
+
+            # Create or update FederationServer record
+            federation_server = self._create_or_update_server(
+                client_ip, client_port, peer_cert
+            )
+
+            if not federation_server:
+                logger.error(f"Failed to create federation server record for {client_ip}")
+                wrapped_socket.close()
+                return
+
+            # Create FederationConnection instance
+            connection = FederationConnection(
+                federation_server=federation_server,
+                app_config=self.app_config,
+                is_inbound=True,
+                wrapped_socket=wrapped_socket
+            )
+
+            # Start the connection
+            if connection.connect():
+                # Store in service's inbound connections
+                self.service.inbound_connections[federation_server.id] = connection
+                logger.info(f"Inbound federation connection established with {federation_server.name}")
+            else:
+                logger.error(f"Failed to initialize inbound connection from {client_ip}")
+                wrapped_socket.close()
+
+        except ssl.SSLError as e:
+            logger.error(f"SSL error during federation connection from {client_ip}: {e}")
+            if wrapped_socket:
+                try:
+                    wrapped_socket.close()
+                except:
+                    pass
+            elif client_socket:
+                try:
+                    client_socket.close()
+                except:
+                    pass
+
+        except Exception as e:
+            logger.error(f"Error handling federation connection from {client_ip}: {e}", exc_info=True)
+            if wrapped_socket:
+                try:
+                    wrapped_socket.close()
+                except:
+                    pass
+            elif client_socket:
+                try:
+                    client_socket.close()
+                except:
+                    pass
+
+    def _create_or_update_server(self, client_ip: str, client_port: int,
+                                  peer_cert: Optional[dict]) -> Optional[FederationServer]:
+        """
+        Create or update FederationServer record for an inbound connection.
+
+        Args:
+            client_ip: Client IP address
+            client_port: Client port number
+            peer_cert: Client's SSL certificate (parsed)
+
+        Returns:
+            FederationServer object or None if failed
+        """
+        try:
+            with db.session.begin():
+                # Extract common name from certificate
+                server_name = client_ip
+                node_id = None
+
+                if peer_cert:
+                    subject = dict(x[0] for x in peer_cert.get('subject', ()))
+                    cn = subject.get('commonName')
+                    if cn:
+                        server_name = cn
+                        node_id = cn
+
+                # Check if server already exists (by address)
+                server = db.session.query(FederationServer).filter_by(
+                    address=client_ip,
+                    connection_type=FederationServer.INBOUND
+                ).first()
+
+                if server:
+                    # Update existing server
+                    logger.debug(f"Updating existing inbound federation server: {server.name}")
+                    server.last_connected = datetime.utcnow()
+                    server.status = FederationServer.STATUS_CONNECTED
+                    server.port = client_port
+                    if node_id:
+                        server.node_id = node_id
+                else:
+                    # Create new server
+                    logger.info(f"Creating new inbound federation server: {server_name}")
+                    server = FederationServer(
+                        name=f"inbound-{server_name}",
+                        description=f"Inbound federation connection from {client_ip}",
+                        address=client_ip,
+                        port=client_port,
+                        connection_type=FederationServer.INBOUND,
+                        protocol_version=self.protocol_version,
+                        use_tls=True,
+                        verify_ssl=True,
+                        enabled=True,
+                        status=FederationServer.STATUS_CONNECTED,
+                        sync_missions=True,
+                        sync_cot=True,
+                        node_id=node_id
+                    )
+                    db.session.add(server)
+                    db.session.flush()  # Get the ID
+
+                return server
+
+        except Exception as e:
+            logger.error(f"Error creating/updating federation server for {client_ip}: {e}", exc_info=True)
+            return None
+
+
 class FederationService:
     """
     Main federation service that manages all federation connections.
@@ -542,6 +1031,8 @@ class FederationService:
     def __init__(self, app_config):
         self.app_config = app_config
         self.connections: dict[int, FederationConnection] = {}
+        self.inbound_connections: dict[int, FederationConnection] = {}
+        self.listeners: dict[str, FederationListener] = {}
         self.running = False
         self.monitor_thread: Optional[threading.Thread] = None
 
@@ -554,6 +1045,26 @@ class FederationService:
         logger.info("Starting Federation Service")
         self.running = True
 
+        # Start inbound listeners for v1 and v2 protocols
+        v1_port = self.app_config.get('OTS_FEDERATION_V1_PORT', 9000)
+        v2_port = self.app_config.get('OTS_FEDERATION_V2_PORT', 9001)
+
+        # Start v1 listener
+        v1_listener = FederationListener(v1_port, "v1", self.app_config, self)
+        if v1_listener.start():
+            self.listeners['v1'] = v1_listener
+            logger.info(f"Federation v1 listener started on port {v1_port}")
+        else:
+            logger.error(f"Failed to start federation v1 listener on port {v1_port}")
+
+        # Start v2 listener
+        v2_listener = FederationListener(v2_port, "v2", self.app_config, self)
+        if v2_listener.start():
+            self.listeners['v2'] = v2_listener
+            logger.info(f"Federation v2 listener started on port {v2_port}")
+        else:
+            logger.error(f"Failed to start federation v2 listener on port {v2_port}")
+
         # Start connection monitor thread
         self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self.monitor_thread.start()
@@ -565,11 +1076,24 @@ class FederationService:
         logger.info("Stopping Federation Service")
         self.running = False
 
-        # Disconnect all connections
+        # Stop all listeners
+        for listener_name, listener in list(self.listeners.items()):
+            logger.info(f"Stopping federation listener: {listener_name}")
+            listener.stop()
+
+        self.listeners.clear()
+
+        # Disconnect all outbound connections
         for connection in list(self.connections.values()):
             connection.disconnect()
 
         self.connections.clear()
+
+        # Disconnect all inbound connections
+        for connection in list(self.inbound_connections.values()):
+            connection.disconnect()
+
+        self.inbound_connections.clear()
 
         if self.monitor_thread and self.monitor_thread.is_alive():
             self.monitor_thread.join(timeout=10)
@@ -604,10 +1128,25 @@ class FederationService:
                                 # Connection failed, will retry on next loop
                                 logger.warning(f"Failed to connect to {server.name}, will retry")
 
-                # Remove disconnected connections
+                # Remove disconnected outbound connections
                 for server_id in list(self.connections.keys()):
                     if not self.connections[server_id].connected:
+                        logger.info(f"Removing disconnected outbound connection for server ID {server_id}")
                         del self.connections[server_id]
+
+                # Remove disconnected inbound connections
+                for server_id in list(self.inbound_connections.keys()):
+                    if not self.inbound_connections[server_id].connected:
+                        logger.info(f"Removing disconnected inbound connection for server ID {server_id}")
+                        # Update database status
+                        try:
+                            with db.session.begin():
+                                server = db.session.query(FederationServer).get(server_id)
+                                if server:
+                                    server.status = FederationServer.STATUS_DISCONNECTED
+                        except Exception as db_error:
+                            logger.error(f"Failed to update inbound server status: {db_error}")
+                        del self.inbound_connections[server_id]
 
                 # Sleep before next check
                 time.sleep(self.app_config.get('OTS_FEDERATION_RETRY_INTERVAL', 60))
