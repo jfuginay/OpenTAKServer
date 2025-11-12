@@ -24,20 +24,13 @@ Before starting, gather these items:
 
 ### For TAK.gov Users
 
-1. **Login to TAK.gov**
-   - Go to https://tak.gov
-   - Sign in with your credentials
+**Contact your TAK.gov administrator** to obtain:
+- The **CA certificate** (root certificate) for federation
+- The **federation server address** (hostname or IP)
+- The **federation port** (typically 9000 for v1 or 9001 for v2)
+- The **protocol version** they're using (v1 or v2)
 
-2. **Download Federation Certificate**
-   - Navigate to your organization's settings
-   - Look for "Federation" or "Certificates" section
-   - Download the **CA Certificate** (root certificate)
-   - Save it as `takgov-ca.pem` on your computer
-
-3. **Note Your Federation Details**
-   - Federation Server Address: `tak.gov` (or specific subdomain)
-   - Federation Port: Usually `9000` (v1) or `9001` (v2)
-   - Protocol Version: Ask your TAK.gov admin (usually v1)
+Save the CA certificate file as `takgov-ca.pem` on your computer.
 
 ### For Self-Hosted TAK Server Users
 
@@ -170,6 +163,11 @@ MIIDvDCCAqSgAwIBAgIUEJfmTS6jeHVrlwSnIyxWldXdBP0wDQYJKoZIhvcNAQEL
    - If accessing remotely: `http://your-server-ip:port`
    - Login as administrator (default username: `administrator`, default password: `password`)
 
+   > **Note:** The Web UI port depends on your installation:
+   > - **Development mode**: Port 5173 (Vite dev server)
+   > - **Production**: Check your `config.yml` for `OTS_LISTENER_PORT` (commonly 8080 or 8081)
+   > - If unsure, run: `cat ~/ots/config.yml | grep OTS_LISTENER_PORT`
+
 2. **Navigate to Federation**
    - Click **Admin** in left sidebar
    - Click **Federation**
@@ -186,6 +184,10 @@ MIIDvDCCAqSgAwIBAgIUEJfmTS6jeHVrlwSnIyxWldXdBP0wDQYJKoZIhvcNAQEL
    Address: tak.gov
    Port: 9000
    ```
+   > **Note:** The port should match the **remote TAK server's** federation port:
+   > - Port **9000** for Federation v1
+   > - Port **9001** for Federation v2
+   > - Ask your TAK server admin which port and version they're using
 
    **Connection Settings:**
    ```
@@ -336,7 +338,6 @@ with psycopg.connect(conn_string) as conn:
 ```bash
 # Make sure you're in the OpenTAKServer virtualenv
 cd ~/OpenTAKServer
-export PATH="/Users/iesouskurios/Library/Python/3.10/bin:$PATH"  # Adjust for your system
 poetry run python ~/add-federation.py
 ```
 
@@ -546,7 +547,6 @@ cat ~/ots/config.yml | grep SQLALCHEMY_DATABASE_URI
 ```bash
 # Run this on your OpenTAKServer
 cd ~/OpenTAKServer
-export PATH="/Users/iesouskurios/Library/Python/3.10/bin:$PATH"
 poetry run python -c "
 from opentakserver.extensions import db
 from opentakserver.models.FederationServer import FederationServer
@@ -610,6 +610,13 @@ psql -U ots -d ots -c "SELECT name, address, port, status, enabled FROM federati
 - **OpenTAKServer Backend:** 8080 (configurable via `OTS_LISTENER_PORT`)
 - **OpenTAKServer UI (Development):** 5173
 - **OpenTAKServer UI (Production):** Typically served by backend or reverse proxy
+
+> **Important Port Clarification:**
+> - **Ports 9000/9001** are the **remote TAK server ports** you're connecting TO (outbound federation)
+> - **Your local OpenTAKServer** uses different ports for **inbound federation** (when others connect to you):
+>   - Default inbound v1: 9100 (`OTS_FEDERATION_V1_PORT`)
+>   - Default inbound v2: 9101 (`OTS_FEDERATION_V2_PORT`)
+> - When filling out the federation form, use the **remote server's ports** (9000/9001), not your local ports
 
 ---
 
