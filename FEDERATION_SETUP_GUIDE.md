@@ -1,7 +1,7 @@
 # OpenTAKServer Federation Setup Guide
 ## Connecting to TAK.gov or Any TAK Server
 
-**Last Updated:** 2025-11-11
+**Last Updated:** 2025-11-12
 **Difficulty:** Intermediate
 **Time Required:** 30-60 minutes
 
@@ -11,10 +11,11 @@
 
 Before starting, gather these items:
 
-- [ ] OpenTAKServer installed and running
+- [ ] OpenTAKServer installed and running with federation enabled
+  - Set `OTS_ENABLE_FEDERATION=true` in your environment or config
 - [ ] Access to your TAK server (TAK.gov account or self-hosted)
 - [ ] TAK server's CA certificate file (usually called `ca.pem`, `ca.crt`, or `truststore-root.pem`)
-- [ ] SSH access to your OpenTAKServer machine
+- [ ] SSH access to your OpenTAKServer machine (or local terminal access)
 - [ ] Administrator login for OpenTAKServer web UI
 
 ---
@@ -165,8 +166,9 @@ MIIDvDCCAqSgAwIBAgIUEJfmTS6jeHVrlwSnIyxWldXdBP0wDQYJKoZIhvcNAQEL
 ### Method 1: Using Web UI (Recommended)
 
 1. **Open OpenTAKServer Web UI**
-   - Go to `http://your-opentakserver:8081`
-   - Login as administrator
+   - Go to your OpenTAKServer UI (default: `http://localhost:5173`)
+   - If accessing remotely: `http://your-server-ip:port`
+   - Login as administrator (default username: `administrator`, default password: `password`)
 
 2. **Navigate to Federation**
    - Click **Admin** in left sidebar
@@ -187,9 +189,9 @@ MIIDvDCCAqSgAwIBAgIUEJfmTS6jeHVrlwSnIyxWldXdBP0wDQYJKoZIhvcNAQEL
 
    **Connection Settings:**
    ```
-   Connection Type: Outbound
-   Protocol Version: v1
-   Transport Protocol: tcp
+   Connection Type: Outbound (Connect to remote server)
+   Protocol Version: Federation V1 (Port 9000)
+   Transport Protocol: TCP (Transmission Control Protocol)
    Use TLS: ✓ (checked)
    Verify SSL: ✓ (checked)
    ```
@@ -202,23 +204,33 @@ MIIDvDCCAqSgAwIBAgIUEJfmTS6jeHVrlwSnIyxWldXdBP0wDQYJKoZIhvcNAQEL
 
 5. **Add Certificates**
 
-   You need to paste the certificate contents as text.
+   You can either **upload certificate files** or **paste certificate contents**.
 
-   **Get TAK Server CA Certificate:**
+   **Option A: Upload Files (Easier)**
+
+   Click the **"Upload File"** button next to each certificate field:
+   - **CA Certificate**: Upload `~/ots/federation/truststore/tak-ca.crt`
+   - **Client Certificate**: Upload `~/ots/federation/client.crt`
+   - **Client Key**: Upload `~/ots/federation/client.key`
+
+   **Option B: Copy/Paste Certificate Text**
+
+   If you prefer to paste manually, get the certificate contents:
+
    ```bash
-   # On your server via SSH:
+   # TAK Server CA Certificate:
    cat ~/ots/federation/truststore/tak-ca.crt
    ```
    Copy entire output, paste into **"CA Certificate"** field
 
-   **Get Your Client Certificate:**
    ```bash
+   # Your Client Certificate:
    cat ~/ots/federation/client.crt
    ```
    Copy entire output, paste into **"Client Certificate"** field
 
-   **Get Your Client Key:**
    ```bash
+   # Your Client Key:
    cat ~/ots/federation/client.key
    ```
    Copy entire output, paste into **"Client Key"** field
@@ -595,8 +607,9 @@ psql -U ots -d ots -c "SELECT name, address, port, status, enabled FROM federati
 
 - **Federation v1:** 9000
 - **Federation v2:** 9001
-- **OpenTAKServer UI:** 8081
-- **OpenTAKServer API:** 8081
+- **OpenTAKServer Backend:** 8080 (configurable via `OTS_LISTENER_PORT`)
+- **OpenTAKServer UI (Development):** 5173
+- **OpenTAKServer UI (Production):** Typically served by backend or reverse proxy
 
 ---
 
