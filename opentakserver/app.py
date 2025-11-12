@@ -62,7 +62,7 @@ def init_extensions(app):
     logger.info(f"OpenTAKServer {opentakserver.__version__}")
     logger.info("Loading the database...")
     with app.app_context():
-        upgrade(directory=os.path.join(os.path.dirname(os.path.realpath(opentakserver.__file__)), 'migrations'))
+        upgrade(directory=os.path.join(os.path.dirname(os.path.realpath(opentakserver.__file__)), 'migrations'), revision='heads')
         # Flask-Migrate does weird things to the logger
         logger.disabled = False
         logger.parent.handlers.pop()
@@ -103,7 +103,7 @@ def init_extensions(app):
     socketio_logger = False
     if app.config.get("DEBUG"):
         socketio_logger = logger
-    socketio.init_app(app, logger=socketio_logger, ping_timeout=1, message_queue="amqp://" + app.config.get("OTS_RABBITMQ_SERVER_ADDRESS"))
+    socketio.init_app(app, logger=socketio_logger, ping_timeout=1, message_queue="amqp://" + app.config.get("OTS_RABBITMQ_SERVER_ADDRESS"), cors_allowed_origins="*")
 
     rabbit_credentials = pika.PlainCredentials(app.config.get("OTS_RABBITMQ_USERNAME"), app.config.get("OTS_RABBITMQ_PASSWORD"))
     rabbit_host = app.config.get("OTS_RABBITMQ_SERVER_ADDRESS")
@@ -337,7 +337,7 @@ def main(app):
         try:
             logger.info("Starting Federation Service")
             from opentakserver.blueprints.federation.federation_service import FederationService
-            app.federation_service = FederationService(app)
+            app.federation_service = FederationService(app.config, app)
             app.federation_service.start()
             logger.info("Federation Service started successfully")
         except BaseException as e:
