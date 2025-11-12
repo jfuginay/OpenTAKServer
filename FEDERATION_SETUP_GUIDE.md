@@ -390,19 +390,19 @@ tail -f ~/ots/logs/opentakserver.log | grep -i federation
 
 **Look for these messages:**
 
-✅ **Good (connecting):**
+**Good (connecting):**
 ```
 INFO - Attempting to connect to federation server: TAK.gov Production
 INFO - Connecting to federation server: TAK.gov Production (tak.gov:9000) via TCP
 ```
 
-✅ **Success:**
+**Success:**
 ```
 INFO - Successfully connected to TAK.gov Production
 INFO - Federation connection established
 ```
 
-❌ **Problems:**
+**Problems:**
 ```
 ERROR - Failed to connect to federation server: [SSL: CERTIFICATE_VERIFY_FAILED]
 ERROR - Connection refused
@@ -413,7 +413,7 @@ ERROR - Timeout connecting to TAK server
 
 1. Go to **Admin → Federation**
 2. Look at the **Status** column for your server
-3. **Green "Connected"** = Success! 🎉
+3. **Green "Connected"** = Success
 4. **Gray "Disconnected"** = Still trying or failed
 5. **Red "Error"** = Problem (check logs)
 
@@ -641,7 +641,3 @@ Testing:
 - [ ] Connection status shows "connected" in Web UI
 - [ ] No errors in OpenTAKServer logs
 - [ ] CoT messages forwarding successfully
-
----
-
-**Good luck! You've got this. 🎖️**
