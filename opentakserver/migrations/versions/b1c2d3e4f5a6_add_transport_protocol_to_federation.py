@@ -22,8 +22,8 @@ def upgrade():
     op.add_column('federation_servers',
         sa.Column('transport_protocol', sa.String(length=20), nullable=False, server_default='tcp')
     )
-    # Remove server_default after adding the column (keep default in model only)
-    op.alter_column('federation_servers', 'transport_protocol', server_default=None)
+    # Note: Skipping alter_column to drop default - SQLite doesn't support this
+    # The server_default is kept in the schema
     # ### end Alembic commands ###
 
 
